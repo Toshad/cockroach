@@ -1237,6 +1237,66 @@ func removeDeadReplicas(
 	return batch, nil
 }
 
+var removeConflictingReplicaCmd = &cobra.Command{
+  Use:   "remove-conflicting-replicas --replica=[replicaId] [path]",
+  Short: "Remove a replica that has a conflict",
+  Long:  `Add stuff here`,
+  Args:  cobra.ExactArgs(2),
+  RunE:  MaybeDecorateGRPCError(runRemoveConflictingReplicaCmd),
+}
+
+func removeReplica(ctx context.Context, db *engine.RocksDB, desc roachpb.RangeDescriptor) error {
+  batch2 := db.NewWriteOnlyBatch()
+  defer batch2.Close()
+  for _, keyRange := range rditer.MakeAllKeyRanges(&desc) {
+    fmt.Printf("Deleting Keyrange from %s to %s", keyRange.Start, keyRange.End)
+    if err := batch2.ClearRange(keyRange.Start, keyRange.End); err != nil {
+      return err
+    }
+  }
+  tombstoneKey := keys.RaftTombstoneKey(desc.RangeID)
+  tombstone := &roachpb.RaftTombstone{
+    NextReplicaID: desc.NextReplicaID,
+  }
+  return engine.MVCCPutProto(ctx, db, nil, tombstoneKey,
+    hlc.Timestamp{}, nil, tombstone)
+}
+
+func runRemoveConflictingReplicaCmd(cmd *cobra.Command, args []string) error {
+  stopper := stop.NewStopper()
+  defer stopper.Stop(context.Background())
+
+  db, err := OpenExistingStore(args[0], stopper, false /* readOnly */)
+  if err != nil {
+    return err
+  }
+  defer db.Close()
+
+  ctx := context.Background()
+  id2, _ := strconv.Atoi(args[2])
+  id1, _ := strconv.Atoi(args[1])
+  desc2, err2 := loadRangeDescriptor(db, roachpb.RangeID(id2))
+  if err2 != nil {
+    return err2
+  }
+  desc1, err1 := loadRangeDescriptor(db, roachpb.RangeID(id1))
+  if err1 != nil {
+    return err1
+  }
+
+  if desc1.ContainsKey(desc2.StartKey) || desc2.ContainsKey(desc1.StartKey) {
+    fmt.Printf("Removing %s and %s from the store", desc2.RangeID.String(), desc1.RangeID.String())
+  } else {
+    fmt.Printf("Not doing anything with %s and %s", desc2.RangeID.String(), desc1.RangeID.String())
+    return nil
+  }
+  err = removeReplica(ctx, db, desc1)
+  if err != nil {
+    return err
+  }
+  return removeReplica(ctx, db, desc2)
+}
+
 var debugMergeLogsCommand = &cobra.Command{
 	Use:   "merge-logs <log file globs>",
 	Short: "merge multiple log files from different machines into a single stream",
@@ -1300,6 +1360,7 @@ var debugCmds = append(DebugCmdsForRocksDB,
 	debugSyncBenchCmd,
 	debugSyncTestCmd,
 	debugUnsafeRemoveDeadReplicasCmd,
+  removeConflictingReplicaCmd,
 	debugEnvCmd,
 	debugZipCmd,
 	debugMergeLogsCommand,
